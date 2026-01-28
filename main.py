@@ -1,10 +1,11 @@
 import os
+import math
 from datetime import datetime
 from typing import Dict
 
 import pytz
 import swisseph as swe
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 
@@ -14,9 +15,8 @@ from pydantic import BaseModel
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EPHE_PATH = os.path.join(BASE_DIR, "ephe")
-swe.set_ephe_path(EPHE_PATH)
 
-# Используем Swiss Ephemeris
+swe.set_ephe_path(EPHE_PATH)
 swe.set_sid_mode(swe.SIDM_FAGAN_BRADLEY, 0, 0)
 
 
@@ -24,7 +24,7 @@ swe.set_sid_mode(swe.SIDM_FAGAN_BRADLEY, 0, 0)
 # FastAPI app
 # =========================
 
-app = FastAPI(title="AstroCore API")
+app = FastAPI(title="Astrocore API")
 
 
 # =========================
@@ -36,7 +36,7 @@ class ChartRequest(BaseModel):
     time: str        # HH:MM
     lat: float
     lon: float
-    timezone: str    # Europe/Moscow
+    timezone: str    # e.g. Europe/Moscow
 
 
 # =========================
@@ -44,9 +44,8 @@ class ChartRequest(BaseModel):
 # =========================
 
 SIGNS = [
-    "Aries", "Taurus", "Gemini", "Cancer",
-    "Leo", "Virgo", "Libra", "Scorpio",
-    "Sagittarius", "Capricorn", "Aquarius", "Pisces"
+    "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+    "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"
 ]
 
 
@@ -54,7 +53,11 @@ def lon_to_sign(lon: float) -> str:
     return SIGNS[int(lon // 30) % 12]
 
 
-def to_julian(dt: datetime) -> float:
+def to_julian_day(date: str, time: str, tz_name: str) -> float:
+    tz = pytz.timezone(tz_name)
+    dt = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
+    dt = tz.localize(dt).astimezone(pytz.utc)
+
     return swe.julday(
         dt.year,
         dt.month,
@@ -69,85 +72,70 @@ def to_julian(dt: datetime) -> float:
 
 @app.get("/")
 def root():
-    return {"status": "ok"}
+    return {"status": "ok", "service": "astrocore"}
 
 
 @app.get("/ping")
 def ping():
-    return {"ping": "pong"}
+    return {"pong": True}
 
 
 @app.post("/chart")
 def chart(req: ChartRequest):
-    # --- Parse datetime ---
-    tz = pytz.timezone(req.timezone)
-    naive_dt = datetime.strptime(
-        f"{req.date} {req.time}",
-        "%Y-%m-%d %H:%M"
-    )
-    local_dt = tz.localize(naive_dt)
-    utc_dt = local_dt.astimezone(pytz.UTC)
+    try:
+        jd = to_julian_day(req.date, req.time, req.timezone)
 
-    jd = to_julian(utc_dt)
-
-    # --- Planets ---
-    planets: Dict[str, Dict] = {}
-
-    planet_ids = {
-        "Sun": swe.SUN,
-        "Moon": swe.MOON,
-        "Mercury": swe.MERCURY,
-        "Venus": swe.VENUS,
-        "Mars": swe.MARS,
-        "Jupiter": swe.JUPITER,
-        "Saturn": swe.SATURN,
-        "Uranus": swe.URANUS,
-        "Neptune": swe.NEPTUNE,
-        "Pluto": swe.PLUTO,
-    }
-
-    for name, pid in planet_ids.items():
-        lon, lat, dist, speed_lon = swe.calc_ut(jd, pid)[0]
-        planets[name] = {
-            "lon": round(lon, 3),
-            "sign": lon_to_sign(lon)
+        planets = {
+            "Sun": swe.SUN,
+            "Moon": swe.MOON,
+            "Mercury": swe.MERCURY,
+            "Venus": swe.VENUS,
+            "Mars": swe.MARS,
+            "Jupiter": swe.JUPITER,
+            "Saturn": swe.SATURN,
+            "Uranus": swe.URANUS,
+            "Neptune": swe.NEPTUNE,
+            "Pluto": swe.PLUTO,
         }
 
-    # --- Houses (Placidus) ---
-    houses_raw, ascmc = swe.houses(
-        jd,
-        req.lat,
-        req.lon,
-        b'P'
-    )
+        planets_out: Dict[str, Dict] = {}
 
-    houses = {
-        "ASC": {
-            "lon": round(ascmc[0], 3),
-            "sign": lon_to_sign(ascmc[0])
-        },
-        "MC": {
-            "lon": round(ascmc[1], 3),
-            "sign": lon_to_sign(ascmc[1])
+        for name, pid in planets.items():
+            lon, lat, dist = swe.calc_ut(jd, pid)[0][:3]
+            lon = lon % 360
+
+            planets_out[name] = {
+                "lon": round(lon, 4),
+                "sign": lon_to_sign(lon)
+            }
+
+        # Houses
+        houses, ascmc = swe.houses(jd, req.lat, req.lon)
+
+        houses_out = {
+            "ASC": {
+                "lon": round(ascmc[0] % 360, 4),
+                "sign": lon_to_sign(ascmc[0] % 360)
+            },
+            "MC": {
+                "lon": round(ascmc[1] % 360, 4),
+                "sign": lon_to_sign(ascmc[1] % 360)
+            }
         }
-    }
 
-    for i in range(12):
-        houses[f"House_{i+1}"] = {
-            "lon": round(houses_raw[i], 3),
-            "sign": lon_to_sign(houses_raw[i])
+        return {
+            "meta": {
+                "date": req.date,
+                "time": req.time,
+                "lat": req.lat,
+                "lon": req.lon,
+                "timezone": req.timezone
+            },
+            "planets": planets_out,
+            "houses": houses_out
         }
 
-    # --- Response ---
-    return {
-        "meta": {
-            "date": req.date,
-            "time": req.time,
-            "lat": req.lat,
-            "lon": req.lon,
-            "timezone": req.timezone
-        },
-        "planets": planets,
-        "houses": houses
-    }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
