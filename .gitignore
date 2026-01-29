@@ -1,0 +1,6 @@
+# Swiss Ephemeris data (DO NOT COMMIT)
+ephe/
+
+# Python cache
+__pycache__/
+*.pyc
