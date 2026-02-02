@@ -59,7 +59,7 @@ ASPECTS = [
 LUMINARIES = {"Sun", "Moon"}
 LUM_BONUS = {"Conjunction": 2, "Opposition": 2, "Square": 1, "Trine": 1, "Sextile": 1}
 
-# Optional: common abbreviations fallback (use offsets; no DST handling here)
+# Optional: common abbreviations fallback (offset-based; no DST handling here)
 TZ_ALIASES = {
     "MSK": "+03:00",
     "UTC": "UTC",
@@ -115,6 +115,7 @@ def pretty_pos(lon: float) -> dict:
 
 
 _OFFSET_RE = re.compile(r"^(?:UTC|GMT)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?$", re.IGNORECASE)
+
 
 def parse_tz(tz_str: str) -> tzinfo:
     """
@@ -293,7 +294,7 @@ def calc_aspects(planets: Dict[str, Any], angles: Dict[str, Any]) -> list:
 # API
 # ======================================================
 
-app = FastAPI(title="AstroCore API", version="1.0.1")
+app = FastAPI(title="AstroCore API", version="1.0.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -326,10 +327,15 @@ def ping():
     return {"status": "ok"}
 
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
 @app.get("/version")
 def version():
     return {
-        "version": "1.0.1",
+        "version": "1.0.2",
         "python": f"{os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}",
         "ephe_path": str(EPHE_PATH),
         "ephe_exists": EPHE_PATH.exists(),
@@ -368,4 +374,9 @@ def chart(req: ChartRequest):
 
 # ======================================================
 # LOCAL / RAILWAY RUN
-# ================================================
+# ======================================================
+
+if __name__ == "__main__":
+    # Railway provides PORT. Locally will use 8000.
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
