@@ -8,7 +8,7 @@ import os
 import re
 from pathlib import Path
 from datetime import datetime, timezone, timedelta, tzinfo
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -60,11 +60,10 @@ LUMINARIES = {"Sun", "Moon"}
 LUM_BONUS = {"Conjunction": 2, "Opposition": 2, "Square": 1, "Trine": 1, "Sextile": 1}
 
 # Optional: common abbreviations fallback (offset-based; no DST handling here)
-TZ_ALIASES = {
-    "MSK": "+03:00",
-    "UTC": "UTC",
-    "GMT": "UTC",
-}
+TZ_ALIASES = {"MSK": "+03:00", "UTC": "UTC", "GMT": "UTC"}
+
+# Default house system (horary default: Regiomontanus)
+DEFAULT_HSYS = os.getenv("HSYS", "R").upper()
 
 
 # ======================================================
@@ -73,36 +72,6 @@ TZ_ALIASES = {
 
 def norm360(x: float) -> float:
     return x % 360.0
-
-
-def unwrap_cusps(cusps: list[float]) -> list[float]:
-    """Make cusps strictly non-decreasing by adding 360 when they wrap."""
-    out = [norm360(x) for x in cusps]
-    for i in range(1, len(out)):
-        while out[i] < out[i - 1]:
-            out[i] += 360.0
-    return out
-
-
-def house_of_lon(lon: float, houses: dict) -> int:
-    """
-    Determine house number (1..12) for a point at ecliptic longitude lon,
-    given houses dict like {"1": {"lon": ...}, ..., "12": {"lon": ...}}.
-    """
-    cusps = [float(houses[str(i)]["lon"]) for i in range(1, 13)]
-    c = unwrap_cusps(cusps)
-
-    L = norm360(float(lon))
-    while L < c[0]:
-        L += 360.0
-
-    for i in range(12):
-        start = c[i]
-        end = (c[0] + 360.0) if i == 11 else c[i + 1]
-        if start <= L < end:
-            return i + 1
-
-    return 12
 
 
 def shortest_arc(a: float, b: float) -> float:
@@ -182,7 +151,6 @@ def parse_tz(tz_str: str) -> tzinfo:
 
 def parse_datetime(date: str, time: str, tz: str) -> datetime:
     zone = parse_tz(tz)
-
     dt_str = f"{date} {time}"
 
     try:
@@ -205,6 +173,65 @@ def julday(dt: datetime) -> float:
     return float(swe.julday(utc.year, utc.month, utc.day, hour))
 
 
+def in_arc_ccw(x: float, start: float, end: float) -> bool:
+    """
+    True if longitude x is in CCW arc from start to end (increasing degrees),
+    handling wrap at 360. start inclusive, end exclusive.
+    """
+    x = norm360(x)
+    start = norm360(start)
+    end = norm360(end)
+    if start <= end:
+        return start <= x < end
+    return (x >= start) or (x < end)
+
+
+def house_from_cusps(pl_lon: float, cusps: List[float]) -> int:
+    """
+    Determine house by which cusp interval contains the planet longitude.
+    cusps: list of 12 cusp longitudes (House 1..12) in degrees.
+    """
+    if len(cusps) != 12:
+        raise ValueError("cusps must have length 12")
+
+    pl_lon = norm360(pl_lon)
+
+    for i in range(12):
+        start = float(cusps[i])
+        end = float(cusps[(i + 1) % 12])
+        if in_arc_ccw(pl_lon, start, end):
+            return i + 1
+
+    # Fallback (should not happen)
+    return 1
+
+
+def normalize_hsys(hsys: Optional[str]) -> str:
+    """
+    Swiss Ephemeris expects a single ASCII letter for house system.
+    We'll accept strings like "R", "Regiomontanus", "Placidus", etc.
+    """
+    if not hsys:
+        return DEFAULT_HSYS
+
+    s = str(hsys).strip()
+    if not s:
+        return DEFAULT_HSYS
+
+    # If they pass full name, take first letter as a pragmatic fallback
+    # (e.g., "Regiomontanus" -> "R")
+    letter = s[0].upper()
+
+    # Swiss Ephemeris supported house system letters are multiple;
+    # we won't hard-fail here — just ensure single ASCII char.
+    try:
+        letter.encode("ascii")
+    except UnicodeEncodeError:
+        raise HTTPException(status_code=422, detail=f"Invalid hsys (non-ascii): {hsys}")
+
+    return letter
+
+
 # ======================================================
 # SCHEMAS
 # ======================================================
@@ -215,6 +242,7 @@ class ChartRequest(BaseModel):
     lat: float = Field(..., ge=-90, le=90)
     lon: float = Field(..., ge=-180, le=180)
     timezone: str
+    hsys: Optional[str] = None  # e.g. "R", "P", "K", ...
 
 
 class ChartResponse(BaseModel):
@@ -230,33 +258,24 @@ class ChartResponse(BaseModel):
 # CORE CALC
 # ======================================================
 
-def calc_planets(jd: float) -> dict:
-    out: Dict[str, Any] = {}
-    for name, pid in PLANETS:
-        try:
-            res, _ = swe.calc_ut(jd, pid, swe.FLG_SWIEPH | swe.FLG_SPEED)
-            lon = float(res[0])
-            speed = float(res[3])
-            out[name] = {
-                **pretty_pos(lon),
-                "speed": round(speed, 6),
-                "is_retrograde": speed < 0,
-            }
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Swiss Ephemeris error calculating {name}: {e}")
-    return out
-
-
-def calc_houses(jd: float, lat: float, lon: float) -> dict:
+def calc_houses(jd: float, lat: float, lon: float, hsys: str) -> dict:
+    """
+    Houses and angles from Swiss Ephemeris.
+    Returns formatted houses + angles and raw cusp degrees for planet house assignment.
+    """
     try:
-        cusps_raw, ascmc = swe.houses(jd, lat, lon, b"P")
+        hsys_letter = normalize_hsys(hsys)
+        hsys_b = hsys_letter.encode("ascii")
+
+        # Swiss Ephemeris houses: (jd_ut, lat, lon, hsys)
+        cusps_raw, ascmc = swe.houses(jd, lat, lon, hsys_b)
 
         # Normalize cusps to exactly 12 items (House 1..12)
         cusps_list = list(cusps_raw)
         if len(cusps_list) == 13:
             cusps_list = cusps_list[1:13]  # drop dummy 0 index
         elif len(cusps_list) >= 12:
-            cusps_list = cusps_list[:12]   # already 12
+            cusps_list = cusps_list[:12]
         else:
             raise RuntimeError(f"Unexpected cusps length: {len(cusps_list)}")
 
@@ -268,7 +287,6 @@ def calc_houses(jd: float, lat: float, lon: float) -> dict:
         mc = float(ascmc[1])
 
         houses = {str(i): pretty_pos(float(cusp_lon)) for i, cusp_lon in enumerate(cusps_list, start=1)}
-
         angles = {
             "ASC": pretty_pos(asc),
             "DSC": pretty_pos(norm360(asc + 180.0)),
@@ -276,12 +294,44 @@ def calc_houses(jd: float, lat: float, lon: float) -> dict:
             "IC": pretty_pos(norm360(mc + 180.0)),
         }
 
-        return {"houses": houses, "angles": angles}
+        return {
+            "houses": houses,
+            "angles": angles,
+            "cusps_deg": [float(x) for x in cusps_list],
+            "hsys": hsys_letter,
+        }
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Swiss Ephemeris houses error: {e}")
+
+
+def calc_planets(jd: float, cusps_deg: List[float]) -> dict:
+    """
+    Planets from Swiss Ephemeris + house attribution using cusps intervals.
+    """
+    out: Dict[str, Any] = {}
+
+    for name, pid in PLANETS:
+        try:
+            res, _ = swe.calc_ut(jd, pid, swe.FLG_SWIEPH | swe.FLG_SPEED)
+            pl_lon = float(res[0])
+            speed = float(res[3])
+
+            house_num = house_from_cusps(pl_lon, cusps_deg)
+
+            out[name] = {
+                **pretty_pos(pl_lon),
+                "speed": round(speed, 6),
+                "is_retrograde": speed < 0,
+                "house": house_num,
+            }
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Swiss Ephemeris error calculating {name}: {e}")
+
+    return out
 
 
 def calc_aspects(planets: Dict[str, Any], angles: Dict[str, Any]) -> list:
@@ -324,7 +374,7 @@ def calc_aspects(planets: Dict[str, Any], angles: Dict[str, Any]) -> list:
 # API
 # ======================================================
 
-app = FastAPI(title="AstroCore API", version="1.0.2")
+app = FastAPI(title="AstroCore API", version="1.0.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -365,10 +415,12 @@ def health():
 @app.get("/version")
 def version():
     return {
-        "version": "1.0.2",
+        "version": "1.0.6",
         "python": f"{os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}",
         "ephe_path": str(EPHE_PATH),
         "ephe_exists": EPHE_PATH.exists(),
+        "default_hsys": DEFAULT_HSYS,
+        "git_sha": os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("GIT_COMMIT") or "unknown",
     }
 
 
@@ -377,13 +429,10 @@ def chart(req: ChartRequest):
     dt = parse_datetime(req.date, req.time, req.timezone)
     jd = julday(dt)
 
-    planets = calc_planets(jd)
-    houses_data = calc_houses(jd, req.lat, req.lon)
+    hsys = normalize_hsys(req.hsys)
 
-    # ✅ add house number for each planet based on cusps
-    for name, p in planets.items():
-        p["house"] = house_of_lon(float(p["lon"]), houses_data["houses"])
-
+    houses_data = calc_houses(jd, req.lat, req.lon, hsys)
+    planets = calc_planets(jd, houses_data["cusps_deg"])
     aspects = calc_aspects(planets, houses_data["angles"])
 
     return {
@@ -391,6 +440,7 @@ def chart(req: ChartRequest):
             "datetime": dt.isoformat(),
             "jd": round(jd, 6),
             "timezone": req.timezone,
+            "hsys": houses_data["hsys"],
         },
         "planets": planets,
         "houses": houses_data["houses"],
