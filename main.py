@@ -75,6 +75,36 @@ def norm360(x: float) -> float:
     return x % 360.0
 
 
+def unwrap_cusps(cusps: list[float]) -> list[float]:
+    """Make cusps strictly non-decreasing by adding 360 when they wrap."""
+    out = [norm360(x) for x in cusps]
+    for i in range(1, len(out)):
+        while out[i] < out[i - 1]:
+            out[i] += 360.0
+    return out
+
+
+def house_of_lon(lon: float, houses: dict) -> int:
+    """
+    Determine house number (1..12) for a point at ecliptic longitude lon,
+    given houses dict like {"1": {"lon": ...}, ..., "12": {"lon": ...}}.
+    """
+    cusps = [float(houses[str(i)]["lon"]) for i in range(1, 13)]
+    c = unwrap_cusps(cusps)
+
+    L = norm360(float(lon))
+    while L < c[0]:
+        L += 360.0
+
+    for i in range(12):
+        start = c[i]
+        end = (c[0] + 360.0) if i == 11 else c[i + 1]
+        if start <= L < end:
+            return i + 1
+
+    return 12
+
+
 def shortest_arc(a: float, b: float) -> float:
     d = abs(norm360(a) - norm360(b))
     return d if d <= 180 else 360 - d
@@ -349,6 +379,11 @@ def chart(req: ChartRequest):
 
     planets = calc_planets(jd)
     houses_data = calc_houses(jd, req.lat, req.lon)
+
+    # ✅ add house number for each planet based on cusps
+    for name, p in planets.items():
+        p["house"] = house_of_lon(float(p["lon"]), houses_data["houses"])
+
     aspects = calc_aspects(planets, houses_data["angles"])
 
     return {
