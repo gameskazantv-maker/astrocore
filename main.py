@@ -27,6 +27,7 @@ import uvicorn
 BASE_DIR = Path(__file__).parent
 EPHE_PATH = Path(os.getenv("EPHE_PATH", str(BASE_DIR / "ephe"))).resolve()
 
+# Set ephemeris path
 swe.set_ephe_path(str(EPHE_PATH))
 
 PLANETS = [
@@ -59,14 +60,44 @@ ASPECTS = [
 LUMINARIES = {"Sun", "Moon"}
 LUM_BONUS = {"Conjunction": 2, "Opposition": 2, "Square": 1, "Trine": 1, "Sextile": 1}
 
+# Optional: common abbreviations fallback (offset-based; no DST handling here)
 TZ_ALIASES = {"MSK": "+03:00", "UTC": "UTC", "GMT": "UTC"}
 
-# По умолчанию — Regiomontanus (как ты и сказал про Астролябия)
+# Default — Regiomontanus (horary)
 DEFAULT_HSYS = os.getenv("HSYS", "R").upper()
 
-# Долгота: по умолчанию "E" (east-positive, географический стандарт).
-# Для Астролябии может понадобиться "W" (west-positive), тогда мы переворачиваем знак.
-DEFAULT_LON_MODE = os.getenv("LON_MODE", "E").upper()
+# Longitude mode:
+# E -> "east positive" (обычно как в геокодерах)
+# W -> "west positive" (если нужно совпасть с некоторыми астросайтами)
+DEFAULT_LON_MODE = os.getenv("LON_MODE", "E").upper()  # "E" or "W"
+
+
+def get_git_sha() -> str | None:
+    # Railway / GitHub / other CI env vars (try in order)
+    for key in (
+        "RAILWAY_GIT_COMMIT_SHA",
+        "GITHUB_SHA",
+        "COMMIT_SHA",
+        "SOURCE_VERSION",
+        "VERCEL_GIT_COMMIT_SHA",
+    ):
+        v = os.getenv(key)
+        if v:
+            return v.strip()
+
+    # fallback: local dev only (if .git exists and git is installed)
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(BASE_DIR),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        return sha
+    except Exception:
+        return None
+
+
+GIT_SHA = get_git_sha()
 
 
 # ======================================================
@@ -147,6 +178,7 @@ def parse_tz(tz_str: str) -> tzinfo:
 def parse_datetime(date: str, time: str, tz: str) -> datetime:
     zone = parse_tz(tz)
     dt_str = f"{date} {time}"
+
     try:
         if time.count(":") == 2:
             dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
@@ -157,6 +189,7 @@ def parse_datetime(date: str, time: str, tz: str) -> datetime:
             status_code=422,
             detail="Invalid date/time format. Use date YYYY-MM-DD and time HH:MM or HH:MM:SS",
         )
+
     return dt.replace(tzinfo=zone)
 
 
@@ -167,13 +200,23 @@ def julday(dt: datetime) -> float:
 
 
 def in_arc_ccw(x: float, start: float, end: float) -> bool:
-    x = norm360(x); start = norm360(start); end = norm360(end)
+    """
+    True if longitude x is in CCW arc from start to end (increasing degrees),
+    handling wrap at 360.
+    """
+    x = norm360(x)
+    start = norm360(start)
+    end = norm360(end)
     if start <= end:
         return start <= x < end
     return (x >= start) or (x < end)
 
 
 def house_from_cusps(pl_lon: float, cusps: List[float]) -> int:
+    """
+    Determine house by which cusp interval contains the planet longitude.
+    cusps: list of 12 cusp longitudes (1..12) in degrees.
+    """
     if len(cusps) != 12:
         raise ValueError("cusps must have length 12")
 
@@ -186,12 +229,17 @@ def house_from_cusps(pl_lon: float, cusps: List[float]) -> int:
     return 1
 
 
-def get_git_sha() -> str | None:
-    try:
-        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(BASE_DIR)).decode().strip()
-        return sha
-    except Exception:
-        return None
+def normalize_lon_input(lon: float, lon_mode: str) -> float:
+    """
+    Convert input longitude into Swiss Ephemeris expected convention (east positive).
+    lon_mode:
+      - "E": input is east-positive (standard) -> keep
+      - "W": input is west-positive -> invert sign
+    """
+    lon_mode = (lon_mode or DEFAULT_LON_MODE).upper()
+    if lon_mode not in ("E", "W"):
+        raise HTTPException(status_code=422, detail=f"Invalid lon_mode: {lon_mode}. Use 'E' or 'W'.")
+    return float(lon if lon_mode == "E" else -lon)
 
 
 # ======================================================
@@ -204,8 +252,9 @@ class ChartRequest(BaseModel):
     lat: float = Field(..., ge=-90, le=90)
     lon: float = Field(..., ge=-180, le=180)
     timezone: str
-    hsys: str | None = None          # "R", "K", ...
-    lon_mode: str | None = None      # "E" (default) or "W" (Astrolabia-like)
+
+    hsys: str | None = None      # e.g. "R", "K", ...
+    lon_mode: str | None = None  # "E" (east+) or "W" (west+)
 
 
 class ChartResponse(BaseModel):
@@ -221,10 +270,10 @@ class ChartResponse(BaseModel):
 # CORE CALC
 # ======================================================
 
-def calc_houses(jd: float, lat: float, lon: float, hsys: str) -> dict:
+def calc_houses(jd: float, lat: float, lon_east_pos: float, hsys: str) -> dict:
     try:
         hsys_b = (hsys or DEFAULT_HSYS).upper().encode("ascii")
-        cusps_raw, ascmc = swe.houses(jd, lat, lon, hsys_b)
+        cusps_raw, ascmc = swe.houses(jd, lat, lon_east_pos, hsys_b)
 
         cusps_list = list(cusps_raw)
         if len(cusps_list) == 13:
@@ -322,10 +371,7 @@ def calc_aspects(planets: Dict[str, Any], angles: Dict[str, Any]) -> list:
 # API
 # ======================================================
 
-APP_VERSION = "1.0.7"
-GIT_SHA = get_git_sha()
-
-app = FastAPI(title="AstroCore API", version=APP_VERSION)
+app = FastAPI(title="AstroCore API", version="1.0.7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -364,13 +410,13 @@ def health():
 @app.get("/version")
 def version():
     return {
-        "version": APP_VERSION,
+        "version": "1.0.7",
         "python": f"{os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}",
         "ephe_path": str(EPHE_PATH),
         "ephe_exists": EPHE_PATH.exists(),
         "default_hsys": DEFAULT_HSYS,
         "default_lon_mode": DEFAULT_LON_MODE,
-        "git_sha": GIT_SHA,
+        "git_sha": GIT_SHA or None,  # ✅ not empty string
     }
 
 
@@ -380,15 +426,10 @@ def chart(req: ChartRequest):
     jd = julday(dt)
 
     hsys = (req.hsys or DEFAULT_HSYS).upper()
-
     lon_mode = (req.lon_mode or DEFAULT_LON_MODE).upper()
-    if lon_mode not in ("E", "W"):
-        raise HTTPException(status_code=422, detail='lon_mode must be "E" or "W"')
+    lon_east_pos = normalize_lon_input(req.lon, lon_mode)
 
-    # КЛЮЧ: для Astrolabia-like (W) переворачиваем знак долготы
-    lon_for_swe = -req.lon if lon_mode == "W" else req.lon
-
-    houses_data = calc_houses(jd, req.lat, lon_for_swe, hsys)
+    houses_data = calc_houses(jd, req.lat, lon_east_pos, hsys)
     planets = calc_planets(jd, houses_data["cusps_deg"])
     aspects = calc_aspects(planets, houses_data["angles"])
 
@@ -399,6 +440,8 @@ def chart(req: ChartRequest):
             "timezone": req.timezone,
             "hsys": houses_data["hsys"],
             "lon_mode": lon_mode,
+            "lon_input": req.lon,
+            "lon_used": round(lon_east_pos, 6),
         },
         "planets": planets,
         "houses": houses_data["houses"],
