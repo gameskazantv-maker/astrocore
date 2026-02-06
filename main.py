@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from pathlib import Path
 from datetime import datetime, timezone, timedelta, tzinfo
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, Any, Tuple, List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,7 +27,6 @@ import uvicorn
 BASE_DIR = Path(__file__).parent
 EPHE_PATH = Path(os.getenv("EPHE_PATH", str(BASE_DIR / "ephe"))).resolve()
 
-# Set ephemeris path (if folder exists — great; if not — still ok for many use-cases)
 swe.set_ephe_path(str(EPHE_PATH))
 
 PLANETS = [
@@ -59,11 +59,14 @@ ASPECTS = [
 LUMINARIES = {"Sun", "Moon"}
 LUM_BONUS = {"Conjunction": 2, "Opposition": 2, "Square": 1, "Trine": 1, "Sextile": 1}
 
-# Optional: common abbreviations fallback (offset-based; no DST handling here)
 TZ_ALIASES = {"MSK": "+03:00", "UTC": "UTC", "GMT": "UTC"}
 
-# Default house system (horary default: Regiomontanus)
-DEFAULT_HSYS = os.getenv("HSYS", "K").upper()
+# По умолчанию — Regiomontanus (как ты и сказал про Астролябия)
+DEFAULT_HSYS = os.getenv("HSYS", "R").upper()
+
+# Долгота: по умолчанию "E" (east-positive, географический стандарт).
+# Для Астролябии может понадобиться "W" (west-positive), тогда мы переворачиваем знак.
+DEFAULT_LON_MODE = os.getenv("LON_MODE", "E").upper()
 
 
 # ======================================================
@@ -117,12 +120,6 @@ _OFFSET_RE = re.compile(r"^(?:UTC|GMT)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?$", re
 
 
 def parse_tz(tz_str: str) -> tzinfo:
-    """
-    Accepts:
-      - IANA: "Europe/Moscow"
-      - "UTC"
-      - Offsets: "+03:00", "-0530", "UTC+3", "GMT+03:00"
-    """
     if not tz_str or not isinstance(tz_str, str):
         raise HTTPException(status_code=422, detail="timezone must be a non-empty string")
 
@@ -132,7 +129,6 @@ def parse_tz(tz_str: str) -> tzinfo:
     if tz_str.upper() in ("UTC", "ETC/UTC"):
         return timezone.utc
 
-    # Offset like +03:00 / UTC+3 / GMT-0530
     m = _OFFSET_RE.match(tz_str.replace(" ", ""))
     if m:
         sign = 1 if m.group(1) == "+" else -1
@@ -142,7 +138,6 @@ def parse_tz(tz_str: str) -> tzinfo:
             raise HTTPException(status_code=422, detail=f"Invalid timezone offset: {tz_str}")
         return timezone(sign * timedelta(hours=hours, minutes=minutes))
 
-    # IANA timezone
     try:
         return ZoneInfo(tz_str)
     except ZoneInfoNotFoundError:
@@ -152,7 +147,6 @@ def parse_tz(tz_str: str) -> tzinfo:
 def parse_datetime(date: str, time: str, tz: str) -> datetime:
     zone = parse_tz(tz)
     dt_str = f"{date} {time}"
-
     try:
         if time.count(":") == 2:
             dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
@@ -163,7 +157,6 @@ def parse_datetime(date: str, time: str, tz: str) -> datetime:
             status_code=422,
             detail="Invalid date/time format. Use date YYYY-MM-DD and time HH:MM or HH:MM:SS",
         )
-
     return dt.replace(tzinfo=zone)
 
 
@@ -174,62 +167,31 @@ def julday(dt: datetime) -> float:
 
 
 def in_arc_ccw(x: float, start: float, end: float) -> bool:
-    """
-    True if longitude x is in CCW arc from start to end (increasing degrees),
-    handling wrap at 360. start inclusive, end exclusive.
-    """
-    x = norm360(x)
-    start = norm360(start)
-    end = norm360(end)
+    x = norm360(x); start = norm360(start); end = norm360(end)
     if start <= end:
         return start <= x < end
     return (x >= start) or (x < end)
 
 
 def house_from_cusps(pl_lon: float, cusps: List[float]) -> int:
-    """
-    Determine house by which cusp interval contains the planet longitude.
-    cusps: list of 12 cusp longitudes (House 1..12) in degrees.
-    """
     if len(cusps) != 12:
         raise ValueError("cusps must have length 12")
 
-    pl_lon = norm360(pl_lon)
-
     for i in range(12):
-        start = float(cusps[i])
-        end = float(cusps[(i + 1) % 12])
+        start = cusps[i]
+        end = cusps[(i + 1) % 12]
         if in_arc_ccw(pl_lon, start, end):
             return i + 1
 
-    # Fallback (should not happen)
     return 1
 
 
-def normalize_hsys(hsys: Optional[str]) -> str:
-    """
-    Swiss Ephemeris expects a single ASCII letter for house system.
-    We'll accept strings like "R", "Regiomontanus", "Placidus", etc.
-    """
-    if not hsys:
-        return DEFAULT_HSYS
-
-    s = str(hsys).strip()
-    if not s:
-        return DEFAULT_HSYS
-
-    # If they pass full name, take first letter as a pragmatic fallback
-    # (e.g., "Regiomontanus" -> "R")
-    letter = s[0].upper()
-
-    # Swiss Ephemeris supported house system letters are multiple;
-    # we won't hard-fail here — just ensure single ASCII char.
+def get_git_sha() -> str | None:
     try:
-        letter.encode("ascii")
-    except UnicodeEncodeError:
-        raise HTTPException(status_code=422, detail=f"Invalid hsys (non-ascii): {hsys}")
-
-    return letter
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(BASE_DIR)).decode().strip()
+        return sha
+    except Exception:
+        return None
 
 
 # ======================================================
@@ -242,7 +204,8 @@ class ChartRequest(BaseModel):
     lat: float = Field(..., ge=-90, le=90)
     lon: float = Field(..., ge=-180, le=180)
     timezone: str
-    hsys: Optional[str] = None  # e.g. "R", "P", "K", ...
+    hsys: str | None = None          # "R", "K", ...
+    lon_mode: str | None = None      # "E" (default) or "W" (Astrolabia-like)
 
 
 class ChartResponse(BaseModel):
@@ -259,27 +222,18 @@ class ChartResponse(BaseModel):
 # ======================================================
 
 def calc_houses(jd: float, lat: float, lon: float, hsys: str) -> dict:
-    """
-    Houses and angles from Swiss Ephemeris.
-    Returns formatted houses + angles and raw cusp degrees for planet house assignment.
-    """
     try:
-        hsys_letter = normalize_hsys(hsys)
-        hsys_b = hsys_letter.encode("ascii")
-
-        # Swiss Ephemeris houses: (jd_ut, lat, lon, hsys)
+        hsys_b = (hsys or DEFAULT_HSYS).upper().encode("ascii")
         cusps_raw, ascmc = swe.houses(jd, lat, lon, hsys_b)
 
-        # Normalize cusps to exactly 12 items (House 1..12)
         cusps_list = list(cusps_raw)
         if len(cusps_list) == 13:
-            cusps_list = cusps_list[1:13]  # drop dummy 0 index
+            cusps_list = cusps_list[1:13]
         elif len(cusps_list) >= 12:
             cusps_list = cusps_list[:12]
         else:
             raise RuntimeError(f"Unexpected cusps length: {len(cusps_list)}")
 
-        # ascmc expected at least [ASC, MC, ...]
         if len(ascmc) < 2:
             raise RuntimeError(f"Unexpected ascmc length: {len(ascmc)}")
 
@@ -298,7 +252,7 @@ def calc_houses(jd: float, lat: float, lon: float, hsys: str) -> dict:
             "houses": houses,
             "angles": angles,
             "cusps_deg": [float(x) for x in cusps_list],
-            "hsys": hsys_letter,
+            "hsys": (hsys or DEFAULT_HSYS).upper(),
         }
 
     except HTTPException:
@@ -308,11 +262,7 @@ def calc_houses(jd: float, lat: float, lon: float, hsys: str) -> dict:
 
 
 def calc_planets(jd: float, cusps_deg: List[float]) -> dict:
-    """
-    Planets from Swiss Ephemeris + house attribution using cusps intervals.
-    """
     out: Dict[str, Any] = {}
-
     for name, pid in PLANETS:
         try:
             res, _ = swe.calc_ut(jd, pid, swe.FLG_SWIEPH | swe.FLG_SPEED)
@@ -327,10 +277,8 @@ def calc_planets(jd: float, cusps_deg: List[float]) -> dict:
                 "is_retrograde": speed < 0,
                 "house": house_num,
             }
-
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Swiss Ephemeris error calculating {name}: {e}")
-
     return out
 
 
@@ -374,11 +322,14 @@ def calc_aspects(planets: Dict[str, Any], angles: Dict[str, Any]) -> list:
 # API
 # ======================================================
 
-app = FastAPI(title="AstroCore API", version="1.0.6")
+APP_VERSION = "1.0.7"
+GIT_SHA = get_git_sha()
+
+app = FastAPI(title="AstroCore API", version=APP_VERSION)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # потом можно ограничить доменами
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -387,11 +338,9 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup_event():
-    # НЕ падаем, если ephe отсутствует.
     if not EPHE_PATH.exists():
         print(f"[WARN] Ephemeris directory not found: {EPHE_PATH} (service will still run)")
         return
-
     se_files = list(EPHE_PATH.glob("*.se1"))
     if not se_files:
         print(f"[WARN] No ephemeris files (*.se1) found in {EPHE_PATH} (service will still run)")
@@ -415,12 +364,13 @@ def health():
 @app.get("/version")
 def version():
     return {
-        "version": "1.0.6",
+        "version": APP_VERSION,
         "python": f"{os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}",
         "ephe_path": str(EPHE_PATH),
         "ephe_exists": EPHE_PATH.exists(),
         "default_hsys": DEFAULT_HSYS,
-        "git_sha": os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("GIT_COMMIT") or "unknown",
+        "default_lon_mode": DEFAULT_LON_MODE,
+        "git_sha": GIT_SHA,
     }
 
 
@@ -429,9 +379,16 @@ def chart(req: ChartRequest):
     dt = parse_datetime(req.date, req.time, req.timezone)
     jd = julday(dt)
 
-    hsys = normalize_hsys(req.hsys)
+    hsys = (req.hsys or DEFAULT_HSYS).upper()
 
-    houses_data = calc_houses(jd, req.lat, req.lon, hsys)
+    lon_mode = (req.lon_mode or DEFAULT_LON_MODE).upper()
+    if lon_mode not in ("E", "W"):
+        raise HTTPException(status_code=422, detail='lon_mode must be "E" or "W"')
+
+    # КЛЮЧ: для Astrolabia-like (W) переворачиваем знак долготы
+    lon_for_swe = -req.lon if lon_mode == "W" else req.lon
+
+    houses_data = calc_houses(jd, req.lat, lon_for_swe, hsys)
     planets = calc_planets(jd, houses_data["cusps_deg"])
     aspects = calc_aspects(planets, houses_data["angles"])
 
@@ -441,6 +398,7 @@ def chart(req: ChartRequest):
             "jd": round(jd, 6),
             "timezone": req.timezone,
             "hsys": houses_data["hsys"],
+            "lon_mode": lon_mode,
         },
         "planets": planets,
         "houses": houses_data["houses"],
@@ -449,9 +407,7 @@ def chart(req: ChartRequest):
         "aspects_meta": {
             "count": len(aspects),
             "note": "Zero aspects is a valid astrological state",
-            "aspects_used": [
-                {"type": n, "symbol": s, "angle": a, "orb": o} for (n, s, a, o) in ASPECTS
-            ],
+            "aspects_used": [{"type": n, "symbol": s, "angle": a, "orb": o} for (n, s, a, o) in ASPECTS],
             "luminary_bonus": LUM_BONUS,
         },
     }
@@ -462,6 +418,5 @@ def chart(req: ChartRequest):
 # ======================================================
 
 if __name__ == "__main__":
-    # Railway provides PORT. Locally will use 8000.
     port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
