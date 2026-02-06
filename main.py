@@ -1,4 +1,4 @@
-# main.py
+\# main.py
 # AstroCore API — FastAPI + Swiss Ephemeris
 # Python 3.11+
 
@@ -9,7 +9,7 @@ import re
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone, timedelta, tzinfo
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -105,7 +105,8 @@ GIT_SHA = get_git_sha()
 # ======================================================
 
 def norm360(x: float) -> float:
-    return x % 360.0
+    x = x % 360.0
+    return x + 360.0 if x < 0 else x
 
 
 def shortest_arc(a: float, b: float) -> float:
@@ -242,9 +243,207 @@ def normalize_lon_input(lon: float, lon_mode: str) -> float:
     return float(lon if lon_mode == "E" else -lon)
 
 
+def ang_diff(a: float, b: float) -> float:
+    """Minimal absolute angular difference 0..180"""
+    d = abs(norm360(a) - norm360(b))
+    return d if d <= 180 else 360.0 - d
+
+
+# ======================================================
+# EXTRA CALC (tabs)
+# ======================================================
+
+def calc_antiscia(planets: Dict[str, Any], cusps_deg: List[float]) -> Tuple[List[dict], dict]:
+    """
+    Antiscia axis: 0°Cap / 0°Cancer (solstitial axis).
+    anti = 180 - lon
+    contra = anti + 180
+    """
+    out: List[dict] = []
+    for body, pdata in planets.items():
+        lon = float(pdata["lon"])
+        anti = norm360(180.0 - lon)
+        contra = norm360(anti + 180.0)
+
+        out.append({
+            "body": body,
+            "lon": round(lon, 6),
+            "antiscia_lon": round(anti, 6),
+            "contra_lon": round(contra, 6),
+            "antiscia_pos": pretty_pos(anti),
+            "contra_pos": pretty_pos(contra),
+            "antiscia_house": house_from_cusps(anti, cusps_deg),
+            "contra_house": house_from_cusps(contra, cusps_deg),
+        })
+
+    meta = {"count": len(out), "axis": "0Cap/0Can"}
+    return out, meta
+
+
+def calc_lots(planets: Dict[str, Any], angles: Dict[str, Any], cusps_deg: List[float]) -> Tuple[dict, dict]:
+    """
+    MVP: Lot of Fortune only.
+    Day/Night (MVP): by Sun house (7..12 => day, 1..6 => night).
+    Fortune:
+      Day: ASC + Moon - Sun
+      Night: ASC + Sun - Moon
+    """
+    if "Sun" not in planets or "Moon" not in planets:
+        return {}, {"count": 0, "note": "Sun or Moon missing"}
+
+    asc = float(angles["ASC"]["lon"])
+    sun = float(planets["Sun"]["lon"])
+    moon = float(planets["Moon"]["lon"])
+
+    sun_house = house_from_cusps(sun, cusps_deg)
+    is_day = sun_house >= 7  # MVP rule
+
+    if is_day:
+        fortuna = norm360(asc + moon - sun)
+    else:
+        fortuna = norm360(asc + sun - moon)
+
+    lots = {
+        "fortuna": {
+            "lon": round(fortuna, 6),
+            "pos": pretty_pos(fortuna),
+            "house": house_from_cusps(fortuna, cusps_deg),
+        }
+    }
+    meta = {"count": len(lots), "computed": list(lots.keys()), "is_day": is_day, "sun_house": sun_house}
+    return lots, meta
+
+
+# MVP fixed stars list (small). Longitudes are approximate tropical positions (simplified).
+FIXED_STARS = [
+    {"name": "Regulus", "lon": 150.20, "mag": 1.35},
+    {"name": "Spica", "lon": 204.00, "mag": 0.98},
+    {"name": "Aldebaran", "lon": 69.00, "mag": 0.85},
+    {"name": "Antares", "lon": 249.50, "mag": 1.06},
+    {"name": "Sirius", "lon": 104.00, "mag": -1.46},
+    {"name": "Vega", "lon": 285.20, "mag": 0.03},
+    {"name": "Arcturus", "lon": 204.30, "mag": -0.05},
+    {"name": "Fomalhaut", "lon": 333.70, "mag": 1.16},
+]
+
+
+def calc_fixed_stars(planets: Dict[str, Any], angles: Dict[str, Any], max_mag: float, orb: float) -> Tuple[List[dict], dict]:
+    """
+    MVP: finds conjunction-ish hits within 'orb' degrees between stars and (planets + ASC/MC).
+    """
+    targets: Dict[str, float] = {k: float(v["lon"]) for k, v in planets.items()}
+    targets.update({"ASC": float(angles["ASC"]["lon"]), "MC": float(angles["MC"]["lon"])})
+
+    out: List[dict] = []
+    for s in FIXED_STARS:
+        if float(s["mag"]) > float(max_mag):
+            continue
+
+        hits = []
+        star_lon = float(s["lon"])
+        for tname, tlon in targets.items():
+            d = ang_diff(star_lon, tlon)
+            if d <= float(orb):
+                hits.append({"target": tname, "delta": round(d, 4)})
+
+        if hits:
+            hits.sort(key=lambda x: x["delta"])
+            out.append({
+                "star": s["name"],
+                "lon": round(star_lon, 6),
+                "pos": pretty_pos(star_lon),
+                "mag": float(s["mag"]),
+                "hits": hits,
+            })
+
+    meta = {"count": len(out), "max_mag": float(max_mag), "orb": float(orb), "stars_scanned": len(FIXED_STARS)}
+    return out, meta
+
+
+TRANSLATION_ASPECTS = [
+    ("Conjunction", 0),
+    ("Sextile", 60),
+    ("Square", 90),
+    ("Trine", 120),
+    ("Opposition", 180),
+]
+
+
+def delta_to_exact_aspect(lon_a: float, lon_b: float, exact_angle: float) -> float:
+    d = ang_diff(lon_a, lon_b)
+    return abs(d - exact_angle)
+
+
+def is_applying_mvp(
+    lon_a: float, spd_a: float, lon_b: float, spd_b: float,
+    exact_angle: float, dt_hours: float = 6.0
+) -> bool:
+    """
+    MVP applying test: compare delta now vs delta after dt_hours using linear motion lon += speed*dt.
+    speed is deg/day in Swiss Ephemeris output -> convert to deg/hour.
+    """
+    # Swiss speed is deg/day
+    a2 = norm360(lon_a + (spd_a / 24.0) * dt_hours)
+    b2 = norm360(lon_b + (spd_b / 24.0) * dt_hours)
+
+    d1 = delta_to_exact_aspect(lon_a, lon_b, exact_angle)
+    d2 = delta_to_exact_aspect(a2, b2, exact_angle)
+    return d2 < d1
+
+
+def calc_translation_of_light(planets: Dict[str, Any], orb: float) -> Tuple[List[dict], dict]:
+    """
+    MVP: Moon translates light from B to C if Moon is applying to aspect with B and also applying to aspect with C.
+    This is simplified and meant to feed the UI tab.
+    """
+    if "Moon" not in planets:
+        return [], {"count": 0, "note": "Moon missing"}
+
+    m_lon = float(planets["Moon"]["lon"])
+    m_spd = float(planets["Moon"].get("speed", 0.0))
+
+    bodies = [k for k in planets.keys() if k != "Moon"]
+    candidates = []  # (body, aspect_name, aspect_angle, orb_delta)
+
+    for b in bodies:
+        b_lon = float(planets[b]["lon"])
+        b_spd = float(planets[b].get("speed", 0.0))
+
+        for aname, aangle in TRANSLATION_ASPECTS:
+            d = delta_to_exact_aspect(m_lon, b_lon, aangle)
+            if d <= float(orb) and is_applying_mvp(m_lon, m_spd, b_lon, b_spd, aangle):
+                candidates.append((b, aname, aangle, d))
+
+    candidates.sort(key=lambda x: x[3])
+
+    out: List[dict] = []
+    for i in range(len(candidates)):
+        b, asp_b, ang_b, d_b = candidates[i]
+        for j in range(i + 1, len(candidates)):
+            c, asp_c, ang_c, d_c = candidates[j]
+            if b == c:
+                continue
+            out.append({
+                "translator": "Moon",
+                "from": b,
+                "to": c,
+                "aspect_from": asp_b,
+                "aspect_to": asp_c,
+                "orb_from": round(d_b, 4),
+                "orb_to": round(d_c, 4),
+            })
+
+    meta = {"count": len(out), "orb": float(orb), "dt_hours": 6.0, "note": "MVP translation_of_light"}
+    return out, meta
+
+
 # ======================================================
 # SCHEMAS
 # ======================================================
+
+IncludeKey = Literal["aspects", "antiscia", "translation", "fixed_stars", "lots"]
+LonMode = Literal["E", "W"]
+
 
 class ChartRequest(BaseModel):
     date: str
@@ -254,7 +453,16 @@ class ChartRequest(BaseModel):
     timezone: str
 
     hsys: str | None = None      # e.g. "R", "K", ...
-    lon_mode: str | None = None  # "E" (east+) or "W" (west+)
+    lon_mode: LonMode | None = None  # "E" (east+) or "W" (west+)
+
+    # NEW (tabs)
+    include: Optional[List[IncludeKey]] = None
+    fixed_stars_max_mag: float = 3.0
+    fixed_stars_orb: float = 1.0
+    orb_translation: float = 1.5
+
+    lot_system: str = "default"
+    lot_names: Optional[List[str]] = None
 
 
 class ChartResponse(BaseModel):
@@ -264,6 +472,19 @@ class ChartResponse(BaseModel):
     angles: dict
     aspects: list
     aspects_meta: dict
+
+    # NEW optional sections
+    antiscia: Optional[list] = None
+    antiscia_meta: Optional[dict] = None
+
+    lots: Optional[dict] = None
+    lots_meta: Optional[dict] = None
+
+    fixed_stars: Optional[list] = None
+    fixed_stars_meta: Optional[dict] = None
+
+    translation_of_light: Optional[list] = None
+    translation_meta: Optional[dict] = None
 
 
 # ======================================================
@@ -371,7 +592,7 @@ def calc_aspects(planets: Dict[str, Any], angles: Dict[str, Any]) -> list:
 # API
 # ======================================================
 
-app = FastAPI(title="AstroCore API", version="1.0.7")
+app = FastAPI(title="AstroCore API", version="1.0.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -410,7 +631,7 @@ def health():
 @app.get("/version")
 def version():
     return {
-        "version": "1.0.7",
+        "version": "1.0.8",
         "python": f"{os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}",
         "ephe_path": str(EPHE_PATH),
         "ephe_exists": EPHE_PATH.exists(),
@@ -433,7 +654,11 @@ def chart(req: ChartRequest):
     planets = calc_planets(jd, houses_data["cusps_deg"])
     aspects = calc_aspects(planets, houses_data["angles"])
 
-    return {
+    include_used = req.include or ["aspects"]
+    # remove duplicates while preserving order
+    include_used = list(dict.fromkeys(include_used))
+
+    resp: Dict[str, Any] = {
         "meta": {
             "datetime": dt.isoformat(),
             "jd": round(jd, 6),
@@ -442,6 +667,7 @@ def chart(req: ChartRequest):
             "lon_mode": lon_mode,
             "lon_input": req.lon,
             "lon_used": round(lon_east_pos, 6),
+            "include_used": include_used,
         },
         "planets": planets,
         "houses": houses_data["houses"],
@@ -455,6 +681,34 @@ def chart(req: ChartRequest):
         },
     }
 
+    # Optional sections
+    if "antiscia" in include_used:
+        antiscia, antiscia_meta = calc_antiscia(planets, houses_data["cusps_deg"])
+        resp["antiscia"] = antiscia
+        resp["antiscia_meta"] = antiscia_meta
+
+    if "lots" in include_used:
+        lots, lots_meta = calc_lots(planets, houses_data["angles"], houses_data["cusps_deg"])
+        resp["lots"] = lots
+        resp["lots_meta"] = lots_meta
+
+    if "fixed_stars" in include_used:
+        fixed_stars, fixed_stars_meta = calc_fixed_stars(
+            planets,
+            houses_data["angles"],
+            max_mag=req.fixed_stars_max_mag,
+            orb=req.fixed_stars_orb,
+        )
+        resp["fixed_stars"] = fixed_stars
+        resp["fixed_stars_meta"] = fixed_stars_meta
+
+    if "translation" in include_used:
+        tol, tol_meta = calc_translation_of_light(planets, orb=req.orb_translation)
+        resp["translation_of_light"] = tol
+        resp["translation_meta"] = tol_meta
+
+    return resp
+
 
 # ======================================================
 # LOCAL / RAILWAY RUN
@@ -463,3 +717,4 @@ def chart(req: ChartRequest):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
