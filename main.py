@@ -1,4 +1,4 @@
-\# main.py
+# main.py
 # AstroCore API — FastAPI + Swiss Ephemeris
 # Python 3.11+
 
