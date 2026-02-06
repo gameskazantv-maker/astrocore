@@ -63,7 +63,7 @@ LUM_BONUS = {"Conjunction": 2, "Opposition": 2, "Square": 1, "Trine": 1, "Sextil
 TZ_ALIASES = {"MSK": "+03:00", "UTC": "UTC", "GMT": "UTC"}
 
 # Default house system (horary default: Regiomontanus)
-DEFAULT_HSYS = os.getenv("HSYS", "R").upper()
+DEFAULT_HSYS = os.getenv("HSYS", "K").upper()
 
 
 # ======================================================
